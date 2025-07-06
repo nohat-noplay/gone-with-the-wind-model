@@ -1,0 +1,711 @@
+---
+title: "ARIMA Wind Simulator"
+author: "Saf Flatters"
+date: "2025-05-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(digits = 10)
+```
+
+# SARIMA Wind Simulator
+
+**Code Author:** Saf Flatters
+
+**Data Source**: [Ballarat Wind Observations Dataset](https://data.ballarat.vic.gov.au/explore/dataset/wind-observations/map/?location=16,-37.5552,143.82493&basemap=31dede)
+
+## 1. Load Required Libraries
+
+```{r}
+# install.packages(c(
+#   "fitdistrplus",
+#   "tidyverse",
+#   "forecast",
+#   "ggplot2",
+#   "tseries",
+#   "lubridate",
+#   "weibullness",
+#   "TTR",
+#   "plotly"
+# ))
+
+
+# Load libraries
+library(fitdistrplus)  # For Weibull distribution fitting
+library(tidyverse)    # Multiple uses
+library(forecast)     # For ARIMA modelling
+library(ggplot2)      # For plotting
+library(tseries)      # For stationarity tests
+library(lubridate)    # For date-time manipulation
+library(weibullness)  # Goodness of fit testing of Weibull MLE
+library(TTR)          # Identifying trends with 7-day smoothing
+library(stats4)       # testing non standard MLEs
+library(plotly)       # interactive ggplots
+```
+
+## 2. Load & Explore Data
+
+```{r}
+# Import data
+wind <- read_csv("wind-observations_ballarat.csv")
+head(wind)
+str(wind)
+```
+
+### Plot raw data
+
+```{r}
+# Plot raw wind speed over time
+wind <- wind[order(wind$date_time), ]   # put in date order 
+plot(wind$date_time, 
+     wind$average_wind_speed, 
+     type = "l", 
+     xlab = "Date/Time", 
+     ylab = "Wind Speed (m/s)", 
+     main = "Wind Speed Over Time - Raw Data")
+```
+
+### Filter and Inspect Observational Density
+
+I examined the observational density to understand how consistently wind speed measurements were recorded over time as it appeared to be inconsistent. This helped me plan how to aggregate the data for modelling.
+
+```{r}
+# Convert date_time column to proper datetime format and filter to one year of data
+wind <- wind %>%
+  mutate(date_time = ymd_hms(date_time)) %>%
+  filter(date_time >= as.POSIXct("2023-04-01") & date_time < as.POSIXct("2024-04-01"))
+
+# Calculate number of observations per hour
+observations_per_hour <- wind %>%
+  mutate(hourly_time = floor_date(date_time, "hour")) %>%
+  group_by(hourly_time) %>%
+  summarise(obs_count = n())
+
+# Plot frequency of observation counts
+ggplot(observations_per_hour, 
+       aes(x = obs_count)) +
+  geom_bar(fill = "skyblue", 
+           color = "black") +
+  labs(title = "Frequency of Observations per Hour",
+       x = "Observations per Hour",
+       y = "Number of Hours") +
+  theme_minimal()
+```
+
+## 3. Preprocess Data
+
+### Clean, Filter, Aggregate
+
+**Cleaned data:** removed not-required columns, stripped `date_time` column to convert entries into POSIXct objects.
+
+**Filtered data:** removed data from outside the target period of April 2023 to March 2024 to have a consistent one-year time window for analysis.
+
+**Aggregated data:** averaged wind speed measurements by hour using the floor of each timestamp to create a regular, evenly spaced time series suitable for ARIMA modelling
+
+```{r}
+# put data in date/time order
+wind <- wind[order(wind$date_time), ]
+
+# remove unrequired columns
+wind$location_description <- NULL
+wind$latitude <- NULL
+wind$longitude <- NULL
+
+# Convert date_time
+wind$date_time <- sub("\\+00:00$", "", wind$date_time) # Remove the "+00:00" timezone suffix 
+wind$date_time <- ymd_hms(wind$date_time) # Convert to POSIXct datetime objects
+
+# rename columns
+names(wind)[names(wind) == "average_wind_speed"] <- "wind_speed"
+
+# Keep only date_time and wind_speed
+wind <- wind[ , 1:2]
+
+# Filter to April 2023-April 2024
+wind <- wind %>%
+  mutate(date_time = ymd_hms(date_time)) %>%
+  filter(date_time >= as.POSIXct("2023-04-01") & date_time < as.POSIXct("2024-04-01"))
+
+# Aggregate the data to hourly averages:
+wind_hourly <- wind %>%
+  mutate(hourly_time = floor_date(date_time, "hour")) %>%  # Round down each timestamp to the hour
+  group_by(hourly_time) %>%    # Group by the hourly time
+  summarise(
+    wind_speed = mean(wind_speed, na.rm = TRUE),  # Compute the mean wind speed for each hour 
+  ) %>%
+  ungroup()
+
+# Check for any missing values in hourly_time column
+cat("Missing Values: ")
+sum(is.na(wind_hourly$hourly_time))
+
+wind_speed_data <- wind_hourly
+```
+
+```{r}
+head(wind_speed_data, 24)
+```
+
+### Explore for patterns
+
+Plot whole timeseries to look for seasonality, trends, anomalies
+
+Plot 7 day smoothed timeseries to look for longer-term trends
+
+```{r}
+#Plot whole timeseries to look for seasonality, trends, anomalies
+
+# Set frequency assuming hourly data (24 obs per day)
+ts_wind <- ts(wind_speed_data$wind_speed, 
+              start = c(2023, 16))
+
+# Plot the time series
+autoplot(ts_wind) + 
+  ggtitle("Wind Speed Time Series")+
+  xlab("Elapsed Time (Hourly") + 
+  ylab("Wind Speed (m/s)")
+
+
+# Plot 7 day smoothed timeseries to look for longer-term trends 
+
+# Apply a rolling mean to highlight trend shifts (7-day window)
+wind_speed_data$trend <- SMA(wind_speed_data$wind_speed, 
+                             n=24*7)  # 7-day smoothing
+
+# Plot the smoothed trend
+ggplot(wind_speed_data, aes(x=hourly_time, y=trend)) +
+  geom_line(color="blue") +
+  ggtitle("Smoothed Wind Speed Trend (7-day Moving Average)") +
+  xlab("Elapsed Time (Hourly)") + 
+  ylab("Wind Speed (m/s")
+
+```
+
+## 4. Distribution Modelling
+
+### Proposed Distribution
+
+Weibull distribution to the observed hourly wind speed data using Maximum Likelihood Estimation (MLE)
+
+```{r}
+set.seed(123)  # reproducibility
+wind_sample <- sample(wind_speed_data$wind_speed, 1000)  # can only have up to 1000 samples for test so randomly sampled from observations
+
+# weibullness test - Null Hypothesis is data follows Weibull
+wp_test_result <- wp.test(wind_sample)
+wp_test_result
+```
+
+### Fit Wiebull on Annual data using MLE
+
+```{r}
+# Fit a Weibull distribution to the wind speed data of entire year 
+annual_weibull_fit <- fitdist(wind_speed_data$wind_speed, 
+                              "weibull", 
+                              method = "mle")  
+
+# Extract parameters 
+shape_param <- annual_weibull_fit$estimate["shape"] 
+scale_param <- annual_weibull_fit$estimate["scale"]  
+
+# Plot the fitted Weibull distribution 
+ggplot(wind_speed_data, aes(x = wind_speed)) +
+    geom_histogram(aes(y = ..density..), 
+                     bins = 30, 
+                     fill = "blue", 
+                     alpha = 0.5) + 
+    stat_function(fun = dweibull, 
+                   args = list(shape = shape_param, 
+                              scale = scale_param),
+                   color = "red", 
+                   size = 1) +
+    ggtitle("Fitted Weibull Distribution for Wind Speed") +
+    xlab("Wind Speed (m/s)") +
+    ylab("Density")
+```
+
+```{r}
+annual_weibull_fit
+```
+
+```{r}
+# Analyse fit against weibull dist
+qqcomp(list(annual_weibull_fit), 
+       legendtext = "Weibull")
+```
+
+### Fit Weibull on Seasonal data using MLE
+
+```{r}
+# add season column to dataframe
+wind_speed_data <- wind_speed_data %>%
+  mutate(
+    month = month(hourly_time),
+    season = case_when(
+      month %in% c(12, 1, 2) ~ "Summer",
+      month %in% c(3, 4, 5) ~ "Autumn",
+      month %in% c(6, 7, 8) ~ "Winter",
+      month %in% c(9, 10, 11) ~ "Spring"
+    )
+  )
+
+# fit weibull to each season separately
+seasonal_params <- wind_speed_data %>%
+  group_by(season) %>%
+  summarise(
+    shape = fitdist(wind_speed, "weibull", method = "mle")$estimate["shape"],
+    scale = fitdist(wind_speed, "weibull", method = "mle")$estimate["scale"],
+    .groups = "drop"
+  )
+
+seasonal_params
+```
+
+```{r}
+# plot 4 seasons PDF with red theoretical PDF
+
+# Create Weibull PDF data frame
+pdf_data <- wind_speed_data %>%
+  group_by(season) %>%
+  summarise(x = list(seq(min(wind_speed), 
+                         max(wind_speed), 
+                         length.out = 300))) %>%
+  unnest(x) %>%
+  left_join(seasonal_params, 
+            by = "season") %>%
+  mutate(pdf = dweibull(x, 
+                        shape = shape, 
+                        scale = scale))
+
+ggplot(wind_speed_data, aes(x = wind_speed, fill = season)) +
+  geom_density(alpha = 0.4) +
+  geom_line(data = pdf_data, 
+            aes(x = x, y = pdf), 
+            colour = "red", 
+            inherit.aes = FALSE) +
+  facet_wrap(~season, scales = "free_y") +
+  labs(title = "Wind Speed Distributions by Season",
+       x = "Wind Speed (m/s)",
+       y = "Density") +
+  theme_minimal()
+```
+
+```{r}
+# plot QQ plots for each season 
+
+# Generate theoretical Weibull quantiles for each row using seasonal shape/scale
+qq_data <- wind_speed_data %>%
+  left_join(seasonal_params, by = "season") %>%
+  group_by(season) %>%
+  arrange(wind_speed) %>%
+  mutate(
+    n = n(),
+    p = ppoints(n),  # generate uniform probs for quantiles
+    weibull_q = qweibull(p, 
+                         shape = shape, 
+                         scale = scale)
+  ) %>%
+  ungroup()
+
+# Plot Q–Q plots by season
+ggplot(qq_data, 
+       aes(x = weibull_q, 
+                    y = wind_speed, 
+                    colour = season)) +
+      geom_point(alpha = 0.4) +
+      geom_abline(slope = 1, 
+                  intercept = 0, 
+                  colour = "black") +
+      facet_wrap(~season, 
+                 scales = "free") +
+      labs(title = "Q–Q Plots of Weibull Fits by Season",
+       x = "Theoretical Quantiles (Weibull)",
+       y = "Empirical Quantiles (Observed Wind Speed)") +
+  theme_minimal() + 
+  theme(legend.position = "none")  
+
+```
+
+### Compare Annual vs Seasonal Weibull fit
+
+```{r}
+# store each season model as fit object
+seasonal_fits <- wind_speed_data %>%
+  group_by(season) %>%
+  summarise(
+    fit = list(fitdist(wind_speed, "weibull")), # MLE fit for each season
+    .groups = "drop"
+  )
+
+# Extract AICs and log-likelihoods for ANNUAL
+loglik_annual <- logLik(annual_weibull_fit)
+aic_annual <- AIC(annual_weibull_fit)
+
+# Extract AICs and log-likelihoods for each season                  
+seasonal_fits <- seasonal_fits %>%
+  mutate(
+    loglik = map_dbl(fit, ~ as.numeric(logLik(.))),
+    aic = map_dbl(fit, AIC)
+  )
+
+
+# Sum the seasonal log-likelihoods and AICs, and label as "Seasonal" model
+comparison <- seasonal_fits %>%
+  summarise(
+    total_loglik = sum(loglik),
+    total_aic = sum(aic)
+  ) %>%
+  mutate(
+    model = "Seasonal"
+  ) %>%
+  
+# Add the annual model results to comparison
+  bind_rows(tibble(
+    model = "Annual",
+    total_loglik = as.numeric(loglik_annual),
+    total_aic = aic_annual
+  ))
+
+comparison
+```
+
+### Simulate Wind Speeds using fitted models
+
+```{r}
+# Simulate seasonal wind speeds using seasonal Weibull parameters
+set.seed(123)  # Reproducibility
+
+# Join fitted shape/scale to the original data
+wind_seasonal <- wind_speed_data %>%
+  left_join(seasonal_params, 
+            by = "season")
+
+# Simulate wind speeds per row using the season's parameters
+wind_seasonal <- wind_seasonal %>%
+  rowwise() %>%
+  mutate(wind_speed = rweibull(1, 
+                               shape = shape, 
+                               scale = scale)) %>%
+  ungroup()
+
+# Store simulated values in a separate data frame
+simulated_data <- wind_seasonal %>%
+  select(season, wind_speed)
+
+# Compare summary statistics
+cat("Simulated Data:\n")
+summary(simulated_data$wind_speed)
+cat("\nActual Data:\n")
+summary(wind_speed_data$wind_speed)
+```
+
+### Validate Simulated data
+
+```{r}
+# Plot simulated vs actual wind speed distributions
+ggplot() +
+  geom_density(data = wind_speed_data, 
+               aes(x = wind_speed, 
+                   color = "Actual Wind Speed"), 
+                   size = 1) +
+  geom_density(data = simulated_data, 
+               aes(x = wind_speed, 
+                   color = "Simulated Wind Speed"), 
+                   size = 1, 
+                   linetype = "dashed") +
+  ggtitle("Comparison: Simulated vs. Actual Wind Speed Distributions") +
+  xlab("Wind Speed (m/s)") + 
+  ylab("Density") +
+  scale_color_manual(values = c("Actual Wind Speed" = "blue", 
+                                "Simulated Wind Speed" = "tomato"))
+```
+
+```{r}
+# data frame of quantiles
+qq_df <- data.frame(
+  actual = sort(wind_speed_data$wind_speed),
+  simulated = sort(simulated_data$wind_speed)
+)
+
+# Q–Q plot
+ggplot(qq_df, aes(x = actual, 
+                  y = simulated)) +
+  geom_point(alpha = 0.4, 
+             colour = "purple") +
+  geom_abline(slope = 1, 
+              intercept = 0, 
+              colour = "black") +
+  labs(
+    title = "Q–Q Plot: Actual vs Simulated Wind Speed",
+    x = "Actual Quantiles",
+    y = "Simulated Quantiles"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+## 5. SARIMA
+
+### Convert to Time series
+
+```{r}
+# convert to Timeseries
+ts_wind <- ts(wind_speed_data$wind_speed, 
+              frequency = 24)
+```
+
+```{r}
+# plot Autocorrelation to look for seasonal patterns
+ggAcf(ts_wind, lag.max = 200) + 
+  ggtitle("Autocorrelation Function (ACF) of Hourly Wind Speed")
+```
+
+### Test for Stationarity
+
+```{r}
+# Test for stationarity
+adf_test <- adf.test(ts_wind)
+adf_test
+```
+
+### Model Selection: SARIMA with auto.arima
+
+```{r}
+# find model params with auto.arima 
+fit_sarima <- auto.arima(ts_wind, seasonal = TRUE)
+summary(fit_sarima)
+checkresiduals(fit_sarima)
+```
+
+### Model Selection: SARIMA with grid search
+
+This is commented out due to excessive computational time - result of this has been put in manually for shorter test time
+
+```{r}
+# # find model params with auto.arima without stepwise and approx
+# fit_sarima_noapprox <- auto.arima(ts_wind, 
+#                          stepwise = FALSE, 
+#                          approximation = FALSE)
+
+# # result: ARIMA(2,1,0)(2,0,0)[24] 
+
+# check fit of 
+# summary(fit_sarima_noapprox)
+# checkresiduals(fit_sarima_noapprox)
+```
+
+```{r}
+# find model params with auto.arima without stepwise and approx result manual
+fit_sarima_noapprox <- Arima(ts_wind,
+                    order = c(2, 1, 0),       # Non-seasonal: AR(2), I(1), MA(0)
+                    seasonal = list(order = c(2, 0, 0),  # Seasonal: SAR(2), SD(0), SMA(0)
+                    period = 24)) 
+fit_sarima_noapprox
+checkresiduals(fit_sarima_noapprox)
+```
+
+### Model Selection: SARIMA manually
+
+#### Plot ACF, PACF and Differencing
+
+```{r}
+# ACF and PACF with No differencing
+ggtsdisplay(ts_wind, lag = 24, 
+            main = "Raw - no differencing")
+
+# ACF and PACF with differencing
+ggtsdisplay(diff(ts_wind), lag = 24, 
+            main = "First Difference")
+```
+
+#### Try Multiple Combinations
+
+```{r}
+# Function to allow for SARIMA manual combinations: returns model and residual check
+fit_sarima <- function(ts_data, 
+                      order = c(0, 0, 0), 
+                      seasonal_order = c(0, 0, 0), 
+                      seasonal_period = 24) {
+  model <- Arima(ts_data,
+                 order = order,
+                 seasonal = list(order = seasonal_order,
+                                 period = seasonal_period))
+  
+  model
+  checkresiduals(model)
+  
+  return(model)
+}
+```
+
+```{r}
+# This code block is used to test multiple combinations of SARIMA and check AIC and residual ACF 
+fit_sarima(ts_wind, 
+           order = c(2, 1, 2), 
+           seasonal_order = c(1, 0, 1))
+```
+
+### Select Best Model
+
+```{r}
+# best model found from Model Selection sections
+bestmodel <- fit_sarima(ts_wind,
+                   order = c(2,1,2),
+                   seasonal_order = c(1, 0, 1))
+bestmodel
+```
+
+## 6. Forecast Wind
+
+```{r}
+# forecast next 48 hours using SARIMA best model and plot
+forecast_wind <- forecast(bestmodel, h = 48)
+autoplot(forecast_wind) +
+  ggtitle("SARIMA Forecast for Wind Speed") +
+  ylab("Wind Speed (m/s)") +
+  xlab("Time") +
+  theme_minimal()
+```
+
+### Interactive Forecast Plot
+
+```{r}
+# Final Presentation plot of Forecast 
+
+# For better visualisation - zoom up on last 10 days
+# Extract the last 240 observations (10 days)
+last_10days <- window(forecast_wind$x, start = tail(time(forecast_wind$x), 240)[1])
+
+# Recompute the forecast model based only on the last 10 days
+forecast_limited <- forecast(last_10days, model = forecast_wind$bestmodel)
+
+# Define number of points
+n_obs <- length(forecast_limited$x)
+n_forecast <- length(forecast_limited$mean)
+total_points <- n_obs + n_forecast
+
+# Create x-axis labels: Day 1–10 (observed), F1–F2 (forecast)
+x_labels <- c(
+  rep(paste0(10:1)),
+  rep(c("F1", "F2"))
+)
+
+# Build data frame and ensure prediction intervals are not below 0
+df <- data.frame(
+  time_index = 1:total_points,
+  value = c(as.numeric(forecast_limited$x), as.numeric(forecast_limited$mean)),
+  type = c(rep("Observed", n_obs), rep("Forecast", n_forecast)),
+  upper_80 = c(rep(NA, n_obs), forecast_limited$upper[, "80%"]),
+  lower_80 = c(rep(NA, n_obs), pmax(0, forecast_limited$lower[, "80%"])),
+  upper_95 = c(rep(NA, n_obs), forecast_limited$upper[, "95%"]),
+  lower_95 = c(rep(NA, n_obs), pmax(0, forecast_limited$lower[, "95%"]))
+)
+
+# For legend
+ribbon_data <- rbind(
+  data.frame(time_index = (n_obs + 1):total_points,
+             ymin = df$lower_80[(n_obs + 1):total_points],
+             ymax = df$upper_80[(n_obs + 1):total_points],
+             Interval = "80% PI"),
+  data.frame(time_index = (n_obs + 1):total_points,
+             ymin = df$lower_95[(n_obs + 1):total_points],
+             ymax = df$upper_95[(n_obs + 1):total_points],
+             Interval = "95% PI")
+)
+
+
+# Plot with both 80% and 95% prediction intervals
+p <- ggplot() +
+  geom_ribbon(data = ribbon_data, 
+              aes(x = time_index, ymin = ymin, ymax = ymax, fill = Interval), 
+              alpha = 0.3) +
+  geom_line(data = df, aes(x = time_index, y = value, colour = type)) +
+  scale_fill_manual(values = c("80% PI" = "blue", "95% PI" = "blue")) +
+  scale_colour_manual(values = c("Observed" = "#00BFC4", "Forecast" = "#F8766D")) +
+  guides(fill = guide_legend(title = NULL),  # Remove fill legend title
+         colour = guide_legend(title = NULL)) +  # Remove colour legend title
+  scale_x_continuous(
+    breaks = seq(12, total_points, by = 24),
+    labels = unique(x_labels)
+  ) +
+  ylab("Wind Speed (m/s)") +
+  xlab("Days before Forecast") +
+  labs(
+    title = "SARIMA 48 Hour Forecast for Wind Speed\nPrevious 10 Days + Forecast Days (F1, F2)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12)
+  )
+
+ggplotly(p)   # interactive plot
+```
+
+## APPENDIX:
+
+### Dealing with complex Seasonality
+
+-   Separate the Seasons: Meteorological Season-specific SARIMA models
+
+-   ARIMAX: ARIMA model with seasonal dummies as a covariate
+
+#### A1. Separate Meteorological Season-specific SARIMA models
+
+```{r}
+# Filter to 1 season only
+separate_data <- wind_speed_data %>% filter(season == "Summer")
+ts_separate <- ts(separate_data$wind_speed, frequency = 24)
+
+autoplot(ts_separate) +
+  ggtitle(paste("Wind Speed Time Series -", wind_speed_data$season[1]))
+```
+
+```{r}
+# Fit SARIMA
+fit_separate <- auto.arima(ts_separate, seasonal = TRUE)
+fit_separate
+# Check residuals
+checkresiduals(fit_separate)
+```
+
+#### A2. ARIMAX - ARIMA with covariates (Additional Marks)
+
+Further study here in ARIMAX used this: <https://robjhyndman.com/hyndsight/arimax/>
+
+```{r}
+# 1. Encode seasons and make dummy matrix 
+
+# Ensure season is a factor
+wind_speed_data$season <- factor(wind_speed_data$season, levels = c("Summer", "Autumn", "Winter", "Spring"))
+
+# Create dummy variables using model.matrix (excluding 1 to avoid multicollinearity)
+season_dummies <- model.matrix(~ season, data = wind_speed_data)[, -1]  # drops intercept (Summer is baseline)
+
+# Check the dummy matrix
+head(season_dummies)
+
+```
+
+```{r}
+
+# 2. fit ARIMAX with covariate (exogenous regressors - encoded seasons)
+ts_wind <- ts(wind_speed_data$wind_speed, frequency = 24)  # daily frequency
+
+# commented out due to excessive computational time. Results ARIMA(2,0,1)(2,0,0)
+
+# Fit SARIMA with seasonal dummy variables as exogenous regressors
+# ARIMAX_sea <- auto.arima(ts_wind,
+#                   xreg = season_dummies,
+#                   seasonal = TRUE,
+#                   stepwise = FALSE,
+#                   approximation = FALSE)
+
+# auto.arima with xreg = season_dummies chosen model:
+ARIMAX_sea <- Arima(ts_wind,
+               order = c(2, 0, 1),
+               seasonal = list(order = c(2, 0, 0), period = 24),
+               xreg = season_dummies)  # exogenous regressors
+summary(ARIMAX_sea)
+checkresiduals(ARIMAX_sea)
+```
