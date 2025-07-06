@@ -71,7 +71,7 @@ Either:
 2. View code and output using .html that was knitted from R Studio. 
 
 ## Credits
-Saf Flatters
+Saf Flatters  
 Data: City of Ballarat open data portal https://data.ballarat.vic.gov.au/explore/dataset/wind-observations/export/
 
 
